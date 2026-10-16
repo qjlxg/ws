@@ -70,7 +70,6 @@ def fetch_telegram_channel(channel_info):
             return []
             
         soup = BeautifulSoup(response.text, "html.parser")
-        # Telegram 网页预览版的消息块
         posts = soup.find_all("div", class_="tgme_widget_message")
         
         messages = []
@@ -87,15 +86,20 @@ def fetch_telegram_channel(channel_info):
             text_div = post.find("div", class_="tgme_widget_message_text")
             text = text_div.get_text(separator="\n", strip=True) if text_div else ""
             
-            # 如果没有文本（纯媒体消息），跳过或根据需要保留，这里过滤纯空消息
             if not text:
                 continue
                 
-            # 提取真实发布时间：解析 <time datetime="..."> 标签
-            time_tag = post.find("time", class_="tgme_widget_message_date")
+            # 提取真实发布时间（精准匹配选择器，兼容外层链接与内层时间标签）
             published_at = ""
-            if time_tag and time_tag.has_attr("datetime"):
-                published_at = time_tag["datetime"]
+            time_tag = post.select_one(".tgme_widget_message_date time[datetime], time[datetime]")
+            if time_tag:
+                published_at = time_tag.get("datetime", "").strip()
+            if not published_at:
+                date_link = post.select_one("a.tgme_widget_message_date")
+                if date_link:
+                    t_tag = date_link.find("time")
+                    if t_tag:
+                        published_at = t_tag.get("datetime", "").strip()
                 
             # 提取永久链接
             link_tag = post.find("a", class_="tgme_widget_message_date")
@@ -108,7 +112,7 @@ def fetch_telegram_channel(channel_info):
                 "link": link,
                 "published_at": published_at,
                 "fetched_at": fetched_at,
-                "category": "general", # 后续由清洗模块分类
+                "category": "general",
                 "language": default_lang
             })
             
@@ -151,10 +155,11 @@ def generate_latest_report():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+    # 严格按照原始发布时间降序排序，若发布时间为空则退化为按抓取时间排序
     cursor.execute("""
-        SELECT channel, post_id, text, link, published_at, language 
+        SELECT channel, post_id, text, link, published_at, fetched_at, language 
         FROM messages 
-        ORDER BY fetched_at DESC 
+        ORDER BY COALESCE(NULLIF(published_at, ''), fetched_at) DESC 
         LIMIT 50
     """)
     rows = [dict(r) for r in cursor.fetchall()]
@@ -163,10 +168,10 @@ def generate_latest_report():
     report_path = REPORTS_DIR / "latest_news.md"
     with report_path.open("w", encoding="utf-8") as f:
         f.write("# 📰 最新采集新闻速递\n\n")
-        f.write(f"> 生成时间: `{datetime.now(timezone.utc).isoformat(timespec='seconds')}` | 展示最新 50 条\n\n---\n\n")
+        f.write(f"> 生成时间: `{datetime.now(timezone.utc).isoformat(timespec='seconds')}` | 按真实发布时间展示最新 50 条\n\n---\n\n")
         
         for idx, row in enumerate(rows, 1):
-            pub_time = row['published_at'] or '时间不详'
+            pub_time = row['published_at'] or f"抓取于 {row['fetched_at']} (原时间不详)"
             f.write(f"### [{idx}] @{row['channel']} ({row['language'].upper()}) | ⏱️ {pub_time}\n\n")
             f.write(f"> {row['text'].replace(chr(10), ' ')}\n\n")
             f.write(f"🔗 [查看原文]({row['link']})\n\n---\n\n")
