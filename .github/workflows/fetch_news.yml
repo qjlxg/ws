@@ -1,7 +1,6 @@
 name: fetch_news
 
 on:
-  # 1. 每次推送修改了脚本、工作流或频道名单时自动触发
   push:
     branches:
       - main
@@ -11,16 +10,13 @@ on:
       - 'load_channels.py'
       - 'channels.csv'
       - '.github/workflows/fetch_news.yml'
-  
-  # 2. 定时触发：北京时间每天早上 8 点和晚上 8 点自动运行
-  # GitHub Cron 使用 UTC 时间。北京时间 = UTC + 8
-  # 北京时间 08:00 = UTC 00:00 -> 0 0 * * *
-  # 北京时间 20:00 = UTC 12:00 -> 0 12 * * *
   schedule:
     - cron: '0 0,12 * * *'
-
-  # 3. 允许在 GitHub Actions 页面手动点击触发
   workflow_dispatch:
+
+# 关键：显式声明写入权限，解决 403 权限拒绝问题
+permissions:
+  contents: write
 
 jobs:
   collect:
@@ -61,9 +57,5 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
-          # 检查 data/news.db 是否有变动
-          git status
           git add data/news.db
-          
-          # 如果有新数据入库，则自动提交回仓库，实现跨运行持久化
           git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-update news database [skip ci]" && git push)
