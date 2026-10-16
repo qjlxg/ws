@@ -2,8 +2,8 @@ name: Process News Pipeline
 
 on:
   schedule:
-    - cron: '30 */6 * * *'  # 每6小时运行一次（可按需调整）
-  workflow_dispatch:      # 支持手动触发
+    - cron: '30 */6 * * *'  # 每6小时自动运行一次
+  workflow_dispatch:      # 支持在 GitHub Actions 页面手动点击触发
 
 jobs:
   process:
@@ -28,9 +28,12 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python process_news.py
 
-      - name: Commit and Push Generated Reports
+      - name: Commit and Push Generated Reports and Cache
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/reports/
-          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-update news digest and reports [skip ci]" && git push)
+          
+          # 将生成的 reports 报告以及 translation_cache.json 翻译缓存一并提交
+          # 这样云端缓存可以持久保存，避免重复翻译消耗额度
+          git add data/reports/ data/translation_cache.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-update news digest, reports and translation cache [skip ci]" && git push)
