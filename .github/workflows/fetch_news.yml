@@ -1,6 +1,7 @@
 name: fetch_news
 
 on:
+  # 1. 当你推送修改了脚本、工作流或频道名单时自动触发
   push:
     branches:
       - main
@@ -10,11 +11,16 @@ on:
       - 'load_channels.py'
       - 'channels.csv'
       - '.github/workflows/fetch_news.yml'
+  
+  # 2. 定时触发：北京时间每天早上 8 点和晚上 8 点自动运行
+  # (UTC 00:00 和 UTC 12:00)
   schedule:
     - cron: '0 0,12 * * *'
+
+  # 3. 允许在 GitHub Actions 页面手动点击触发
   workflow_dispatch:
 
-# 关键：显式声明写入权限，解决 403 权限拒绝问题
+# 显式声明仓库写入权限，确保 bot 可以自动提交更新
 permissions:
   contents: write
 
@@ -46,16 +52,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-news-db-
 
-      - name: 执行增量新闻采集脚本
+      - name: 执行增量新闻采集与报告生成脚本
         env:
           TZ: 'Asia/Shanghai'
         run: |
           python fetch_news.py
 
-      - name: 自动提交并保存更新后的数据库与状态
+      - name: 自动提交并保存更新后的数据库与 Markdown 报告到仓库
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
-          git add data/news.db
-          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-update news database [skip ci]" && git push)
+          # 将底层去重数据库与每次生成的 reports 目录全部加入 Git 追踪
+          git add data/news.db data/reports/
+          
+          # 如果没有文件变动则跳过，有变动则自动 commit 并 push 到主分支
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-update news database and markdown reports [skip ci]" && git push)
