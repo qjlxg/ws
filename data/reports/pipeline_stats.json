@@ -1,14 +1,16 @@
 {
-  "processed_at": "2026-10-16T08:55:10+00:00",
+  "processed_at": "2026-10-16T09:15:54+00:00",
   "total_raw": 59,
   "duplicate_count": 3,
   "unique_count": 56,
+  "cluster_count": 37,
   "languages": {
     "ru": 36,
     "en": 20
   },
-  "categories": {
-    "military": 22,
-    "international": 34
+  "channels": {
+    "tass_agency": 22,
+    "zvezdanews": 14,
+    "psycho_motivations": 20
   }
 }
