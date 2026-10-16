@@ -1,14 +1,23 @@
 import sqlite3
 import json
 import re
-from datetime import datetime, timezone
+import os
+import requests
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from collections import defaultdict, Counter
+from collections import Counter
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "news.db"
 REPORTS_DIR = BASE_DIR / "data" / "reports"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# 严格限定的目标频道白名单
+TARGET_CHANNELS = {"zvezdanews", "rtnews", "CNN_English_News"}
+
+# 从环境变量安全获取 Gemini API Key（本地或 GitHub Secrets 传入）
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 
 def utc_now_iso():
@@ -21,74 +30,124 @@ def connect_db():
     return conn
 
 
-def clean_text_fingerprint(text):
+def translate_text_with_gemini(text, source_lang):
     """
-    改进的文本指纹去重规则：
-    过滤掉常见的固定新闻前缀（如 'главное к этому часу' 等），
-    并截取更有辨识度的核心词组，避免不同新闻因相似开头被误删。
+    使用 Gemini 3.1 Flash Lite 进行智能翻译：
+    若未配置 API Key 或请求异常，自动安全降级返回原文，绝不中断流水线。
     """
+    if not text or not text.strip():
+        return ""
+    
+    # 如果本身就是中文或没有配置 Key，直接返回原文
+    if source_lang == "zh" or not source_lang or not GEMINI_API_KEY:
+        return text
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    headers = {"Content-Type": "application/json"}
+    
+    lang_name = "俄语" if source_lang.lower() == "ru" else "英语" if source_lang.lower() == "en" else source_lang
+    prompt = f"请将以下{lang_name}新闻精准翻译成流畅的中文，直接输出翻译结果，不要加任何多余的解释：\n\n{text}"
+    
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }]
+    }
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=20)
+        if response.status_code == 200:
+            res_json = response.json()
+            translated = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+            return translated
+        else:
+            print(f"[-] 翻译 API 状态码异常 ({response.status_code}): {response.text}")
+    except Exception as e:
+        print(f"[-] 翻译请求异常 ({source_lang}): {e}")
+        
+    # 降级策略：翻译失败时返回原文
+    return text
+
+
+def parse_effective_time(time_str):
+    if time_str is None:
+        return None, False
+    if isinstance(time_str, (int, float)):
+        try:
+            return datetime.fromtimestamp(time_str, tz=timezone.utc), True
+        except Exception:
+            return None, False
+            
+    if isinstance(time_str, str):
+        time_str = time_str.strip()
+        if not time_str:
+            return None, False
+        if time_str.replace('.', '', 1).isdigit():
+            try:
+                ts = float(time_str)
+                if ts > 10**11:
+                    ts /= 1000.0
+                return datetime.fromtimestamp(ts, tz=timezone.utc), True
+            except Exception:
+                pass
+        try:
+            cleaned = time_str.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(cleaned)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt, True
+        except Exception:
+            pass
+    return None, False
+
+
+def get_message_timestamp(msg):
+    dt, success = parse_effective_time(msg.get("published_at"))
+    if not success:
+        dt, success = parse_effective_time(msg.get("fetched_at"))
+    if not success:
+        dt = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    return dt
+
+
+def normalize_full_text(text):
     if not text:
         return ""
-    # 移除 URL
     text = re.sub(r"https?://\S+", "", text)
-    # 转换为小写
     text = text.lower()
-    # 剔除常见的通用新闻前缀短语
-    common_prefixes = [
-        "главное к этому часу", "главное новости", "breaking", 
-        "flash", "update", "сообщает", "мо рф сообщает"
-    ]
-    for prefix in common_prefixes:
-        if text.startswith(prefix):
-            text = text[len(prefix):]
-            
-    # 移除标点符号与特殊字符
     text = re.sub(r"[^\w\s]", "", text)
-    words = text.split()
-    # 过滤掉过短的虚词，取前 15 个有意义的词作为指纹
-    meaningful_words = [w for w in words if len(w) > 2]
-    return " ".join(meaningful_words[:15])
+    return " ".join(text.split())
 
 
-def extract_key_entities(text):
-    """提取文本中的核心英文/俄文实体或数字特征用于跨语言事件匹配候选"""
-    if not text:
-        return set()
-    # 提取大写开头的连续单词、数字、或者特定的国际通用专有名词
-    tokens = re.findall(r'\b[A-Z][a-zA-Z]{3,}\b|\b\d+\b', text)
-    return set(tokens)
-
-
-def cluster_cross_lingual_events(messages):
-    """
-    跨语言事件聚类与多源合并算法（候选识别）：
-    不依赖付费AI，通过提取消息中的核心实体与时间窗口，
-    将指向同一事件的多源报道归纳到一起。
-    """
+def build_safe_topic_candidates(messages):
     clusters = []
-    
     for msg in messages:
-        text = msg["text"]
-        entities = extract_key_entities(text)
+        msg_time = get_message_timestamp(msg)
+        target_text = msg.get("translated_text") or msg["text"]
+        words = set(w for w in re.findall(r'[\u4e00-\u9fa5a-z]{2,}', target_text.lower()))
         
         matched_cluster = None
         for cluster in clusters:
-            # 如果实体交集达到一定数量，或者指纹高度相似，则认为属于同一事件
-            common_entities = entities.intersection(cluster["entities"])
-            if len(common_entities) >= 2:
+            time_diff = abs((msg_time - cluster["base_time"]).total_seconds())
+            if time_diff > 24 * 3600:
+                continue
+            common_words = words.intersection(cluster["keywords"])
+            if len(common_words) >= 3:
                 matched_cluster = cluster
                 break
                 
         if matched_cluster:
             matched_cluster["sources"].append(msg)
-            matched_cluster["entities"].update(entities)
+            matched_cluster["keywords"].update(words)
         else:
             clusters.append({
                 "cluster_id": len(clusters) + 1,
-                "entities": entities,
+                "base_time": msg_time,
+                "keywords": words,
                 "sources": [msg]
             })
-            
     return clusters
 
 
@@ -100,117 +159,156 @@ def run_processing_pipeline():
     conn = connect_db()
     cursor = conn.cursor()
 
-    # 严格按照发布时间或抓取时间读取所有历史存量消息
     cursor.execute("""
         SELECT channel, post_id, text, link, published_at, fetched_at, category, language 
-        FROM messages 
-        ORDER BY COALESCE(NULLIF(published_at, ''), fetched_at) DESC
+        FROM messages
     """)
-    rows = [dict(r) for r in cursor.fetchall()]
+    all_database_rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
 
-    total_raw = len(rows)
-    if total_raw == 0:
-        print("[-] 数据库中无任何新闻消息，跳过二次处理。")
+    total_database_count = len(all_database_rows)
+    if total_database_count == 0:
+        print("[-] 数据库中无任何记录。")
         return
 
-    # 1. 改进的消息级去重统计（保留所有原始数据在数据库中，仅在内存中剥离重复展示）
-    unique_fingerprints = set()
-    deduped_messages = []
+    target_raw_rows = [m for m in all_database_rows if m["channel"] in TARGET_CHANNELS]
+    target_raw_count = len(target_raw_rows)
+    if target_raw_count == 0:
+        print(f"[-] 数据库中未发现目标频道 {TARGET_CHANNELS} 的消息。")
+        return
+
+    valid_text_rows = []
+    empty_text_count = 0
+    time_parse_failed_count = 0
+
+    for msg in target_raw_rows:
+        text = msg.get("text")
+        if not text or not text.strip():
+            empty_text_count += 1
+            continue
+        _, p_ok = parse_effective_time(msg.get("published_at"))
+        _, f_ok = parse_effective_time(msg.get("fetched_at"))
+        if not p_ok and not f_ok:
+            time_parse_failed_count += 1
+        valid_text_rows.append(msg)
+
+    sorted_rows = sorted(valid_text_rows, key=lambda x: get_message_timestamp(x), reverse=True)
+
+    now_utc = datetime.now(timezone.utc)
+    seven_days_ago = now_utc - timedelta(days=7)
+
+    recent_rows = []
+    older_rows = []
+    for msg in sorted_rows:
+        if get_message_timestamp(msg) >= seven_days_ago:
+            recent_rows.append(msg)
+        else:
+            older_rows.append(msg)
+
+    if GEMINI_API_KEY:
+        print(f"[*] 检测到有效 API Key，开始对最近 7 天的 {len(recent_rows)} 条有效素材进行 AI 智能翻译...")
+    else:
+        print(f"[!] 未检测到 GEMINI_API_KEY 环境变量，将跳过 AI 翻译，直接使用原文进行处理。")
+
+    # 执行 AI 翻译并挂载字段
+    for msg in recent_rows:
+        orig_text = msg["text"]
+        lang = msg.get("language", "en")
+        translated = translate_text_with_gemini(orig_text, lang)
+        msg["translated_text"] = translated
+
+    # 去重处理
+    unique_materials_map = {}
     duplicate_count = 0
 
-    for msg in rows:
-        fp = clean_text_fingerprint(msg["text"])
-        if not fp or fp in unique_fingerprints:
-            duplicate_count += 1
+    for msg in recent_rows:
+        norm_text = normalize_full_text(msg.get("translated_text") or msg["text"])
+        if not norm_text:
             continue
-        unique_fingerprints.add(fp)
-        deduped_messages.append(msg)
-
-    # 2. 跨语言事件聚合
-    event_clusters = cluster_cross_lingual_events(deduped_messages)
-
-    # 3. 统计语种与频道分布
-    language_counts = Counter(m["language"] for m in deduped_messages)
-    channel_counts = Counter(m["channel"] for m in deduped_messages)
-
-    # 4. 导出完整数据 JSON (all_news.json)
-    all_news_json_path = REPORTS_DIR / "all_news.json"
-    with all_news_json_path.open("w", encoding="utf-8") as f:
-        json.dump(deduped_messages, f, ensure_ascii=False, indent=2)
-
-    # 5. 输出精选 Markdown 新闻事件与多来源素材报告 (events_digest.md)
-    digest_md_path = REPORTS_DIR / "events_digest.md"
-    with digest_md_path.open("w", encoding="utf-8") as f:
-        f.write(f"# 🌐 全球多语言新闻情报与事件聚合素材简报\n\n")
-        f.write(f"> **处理时间**: `{utc_now_iso()}` | **底层原始总数**: {total_raw} 条 | **去重后独立条目**: {len(deduped_messages)} 条 | **识别事件聚类**: {len(event_clusters)} 组\n\n")
-
-        f.write("## 📊 漏斗与多源统计指标\n\n")
-        f.write(f"- **总接收原始消息**: `{total_raw}` 条\n")
-        f.write(f"- **高相似重复剥离**: `{duplicate_count}` 条\n")
-        f.write(f"- **独立有效新闻素材**: `{len(deduped_messages)}` 条\n")
-        f.write(f"- **多源交叉事件组**: `{len(event_clusters)}` 组\n\n")
-        
-        f.write("### 语种分布:\n")
-        for lang, count in language_counts.items():
-            f.write(f"- **{lang.upper()}**: {count} 条\n")
             
-        f.write("\n### 频道贡献分布:\n")
-        for ch, count in channel_counts.items():
-            f.write(f"- **@{ch}**: {count} 条\n")
-        f.write("\n---\n\n")
+        if norm_text not in unique_materials_map:
+            msg_copy = dict(msg)
+            msg_copy["duplicate_sources"] = []
+            unique_materials_map[norm_text] = msg_copy
+        else:
+            duplicate_count += 1
+            primary_item = unique_materials_map[norm_text]
+            primary_item["duplicate_sources"].append({
+                "channel": msg["channel"],
+                "language": msg["language"],
+                "published_at": msg["published_at"],
+                "fetched_at": msg["fetched_at"],
+                "link": msg["link"],
+                "post_id": msg["post_id"],
+                "text": msg["text"],
+                "translated_text": msg.get("translated_text")
+            })
 
-        f.write("## 🧩 跨语言事件聚类与多源交叉报道汇总\n\n")
-        for idx, cluster in enumerate(event_clusters, 1):
-            sources = cluster["sources"]
-            primary_msg = sources[0]
-            pub_time = primary_msg['published_at'] or primary_msg['fetched_at']
-            
-            f.write(f"### 事件团 #{idx} (涉及 {len(sources)} 个来源通道)\n\n")
-            f.write(f"> **参考时间**: `{pub_time}` | **代表性文摘**: \n")
-            snippet = primary_msg["text"].replace("\n", " ")
-            if len(snippet) > 200:
-                snippet = snippet[:200] + "..."
-            f.write(f"> {snippet}\n\n")
-            
-            f.write("**📢 原始来源与多源链接追踪**:\n")
-            for src in sources:
-                f.write(f"- 频道: **@{src['channel']}** ({src['language'].upper()}) | ⏱️ `{src['published_at'] or '时间不详'}`\n")
-                f.write(f"  - 🔗 [查看原文链接]({src['link']})\n")
-            f.write("\n---\n\n")
+    deduped_recent_valid = list(unique_materials_map.values())
+    topic_clusters = build_safe_topic_candidates(deduped_recent_valid)
+    multi_source_candidates = [c for c in topic_clusters if len(c["sources"]) > 1]
+    single_source_groups = [c for c in topic_clusters if len(c["sources"]) == 1]
 
-    # 6. 同时更新 latest_news.md (全量无截断展示)
-    latest_md_path = REPORTS_DIR / "latest_news.md"
-    with latest_md_path.open("w", encoding="utf-8") as f:
-        f.write("# 📰 最新采集新闻全量速递\n\n")
-        f.write(f"> 生成时间: `{utc_now_iso()}` | 展示全部去重后有效素材 (共 {len(deduped_messages)} 条)\n\n---\n\n")
-        
-        for idx, row in enumerate(deduped_messages, 1):
-            pub_time = row['published_at'] or f"抓取于 {row['fetched_at']}"
-            f.write(f"### [{idx}] @{row['channel']} ({row['language'].upper()}) | ⏱️ {pub_time}\n\n")
-            f.write(f"> {row['text'].replace(chr(10), ' ')}\n\n")
-            f.write(f"🔗 [查看原文]({row['link']})\n\n---\n\n")
+    language_counts = Counter(m["language"] for m in deduped_recent_valid)
+    channel_counts = Counter(m["channel"] for m in deduped_recent_valid)
 
-    # 7. 导出统计指标 JSON (pipeline_stats.json)
-    stats_json_path = REPORTS_DIR / "pipeline_stats.json"
+    # 导出文件
+    with (REPORTS_DIR / "all_news.json").open("w", encoding="utf-8") as f:
+        json.dump(all_database_rows, f, ensure_ascii=False, indent=2)
+
+    with (REPORTS_DIR / "recent_valid_news.json").open("w", encoding="utf-8") as f:
+        json.dump(deduped_recent_valid, f, ensure_ascii=False, indent=2)
+
     stats_data = {
         "processed_at": utc_now_iso(),
-        "total_raw": total_raw,
-        "duplicate_count": duplicate_count,
-        "unique_count": len(deduped_messages),
-        "cluster_count": len(event_clusters),
+        "target_channels": list(TARGET_CHANNELS),
+        "total_database_count": total_database_count,
+        "target_raw_count": target_raw_count,
+        "empty_text_count": empty_text_count,
+        "time_parse_failed_count": time_parse_failed_count,
+        "recent_total_count": len(recent_rows),
+        "older_total_count": len(older_rows),
+        "duplicate_content_count": duplicate_count,
+        "recent_valid_unique_count": len(deduped_recent_valid),
+        "multi_source_candidates_count": len(multi_source_candidates),
         "languages": dict(language_counts),
         "channels": dict(channel_counts)
     }
-    with stats_json_path.open("w", encoding="utf-8") as f:
+    with (REPORTS_DIR / "pipeline_stats.json").open("w", encoding="utf-8") as f:
         json.dump(stats_data, f, ensure_ascii=False, indent=2)
 
-    print(f"\n[+] 新闻智能处理与事件聚合完成！")
-    print(f"    - 原始消息: {total_raw} 条")
-    print(f"    - 逻辑去重: {duplicate_count} 条")
-    print(f"    - 有效素材: {len(deduped_messages)} 条")
-    print(f"    - 事件聚类: {len(event_clusters)} 组")
-    print(f"    - 生成报告: {digest_md_path} & {latest_md_path}\n")
+    # 生成 Markdown 简报
+    digest_md_path = REPORTS_DIR / "events_digest.md"
+    with digest_md_path.open("w", encoding="utf-8") as f:
+        f.write(f"# 🌐 全球多语言情报与 AI 智能聚合简报\n\n")
+        f.write(f"> **处理时间**: `{utc_now_iso()}` | **AI 模型**: `{GEMINI_MODEL if GEMINI_API_KEY else '未启用'}`\n\n")
+        f.write("## 📊 统计漏斗\n\n")
+        f.write(f"- 数据库总量: `{total_database_count}` | 目标频道抓取: `{target_raw_count}`\n")
+        f.write(f"- 近7天有效: `{len(recent_rows)}` | 去重后独立素材: `{len(deduped_recent_valid)}`\n\n---\n\n")
+
+        f.write("## 🧩 同主题候选提示\n\n")
+        for idx, cluster in enumerate(multi_source_candidates, 1):
+            sources = cluster["sources"]
+            primary_msg = sources[0]
+            f.write(f"### 候选组 #{idx} (共 {len(sources)} 个来源)\n\n")
+            f.write(f"> **核心摘要**: {primary_msg.get('translated_text') or primary_msg['text']}\n\n")
+            f.write(f"- 主来源: @{primary_msg['channel']} ({primary_msg['language'].upper()}) | 🔗 [原文]({primary_msg['link']})\n\n---\n\n")
+
+    latest_md_path = REPORTS_DIR / "latest_news.md"
+    with latest_md_path.open("w", encoding="utf-8") as f:
+        f.write("# 📰 最新规范新闻速递\n\n")
+        f.write(f"> 生成时间: `{utc_now_iso()}` | 展示近 7 天去重有效素材\n\n---\n\n")
+        for idx, row in enumerate(deduped_recent_valid, 1):
+            pub_time = row['published_at'] or f"抓取于 {row['fetched_at']}"
+            f.write(f"### [{idx}] @{row['channel']} ({row['language'].upper()}) | ⏱️ {pub_time}\n\n")
+            f.write(f"**[内容]**: {row.get('translated_text') or row['text']}\n\n")
+            if row.get('translated_text') and row.get('translated_text') != row['text']:
+                f.write(f"<details><summary>点击查看外文原文</summary>\n\n> {row['text']}\n\n</details>\n\n")
+            f.write(f"🔗 [查看原文]({row['link']})\n\n---\n\n")
+
+    print(f"\n[+] 新闻处理流水线执行完毕！")
+    print(f"    - 独立素材数: {len(deduped_recent_valid)}")
+    print(f"    - 报告已生成至: {REPORTS_DIR}\n")
 
 
 if __name__ == "__main__":
