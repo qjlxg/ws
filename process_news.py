@@ -4,6 +4,7 @@ import re
 import os
 import time
 import hashlib
+import shutil
 import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -22,6 +23,10 @@ TARGET_CHANNELS = {"zvezdanews", "rtnews", "CNN_English_News"}
 # 从环境变量安全获取 Gemini API Key
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = "gemini-3.1-flash-lite"
+PROMPT_VERSION = "v1"
+
+# 失败重试冷却时间：30分钟（1800秒）内对同一失败文本暂不重复请求 API
+FAILURE_COOLDOWN_SECONDS = 1800
 
 
 def utc_now_iso():
@@ -35,60 +40,80 @@ def connect_db():
 
 
 def load_translation_cache():
-    """加载本地持久化翻译缓存，避免重复请求消耗额度"""
+    """加载本地持久化翻译缓存，若文件损坏则备份并降级，防止历史成果全部丢失"""
     if CACHE_PATH.exists():
         try:
             with CACHE_PATH.open("r", encoding="utf-8") as f:
                 return json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"[-] 警告: 翻译缓存文件损坏 ({e})，正在备份并重建缓存...")
+            try:
+                backup_path = CACHE_PATH.with_suffix(".corrupt.bak")
+                shutil.copy2(CACHE_PATH, backup_path)
+            except Exception:
+                pass
             return {}
     return {}
 
 
 def save_translation_cache(cache_data):
-    """保存翻译缓存到 data/translation_cache.json"""
+    """采用原子写入（Atomic Write）保存翻译缓存，杜绝中途中断写出不完整 JSON"""
     try:
-        with CACHE_PATH.open("w", encoding="utf-8") as f:
+        temp_path = CACHE_PATH.with_suffix(".tmp")
+        with temp_path.open("w", encoding="utf-8") as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
+        temp_path.replace(CACHE_PATH)
     except Exception as e:
-        print(f"[-] 保存翻译缓存失败: {e}")
+        print(f"[-] 保存翻译缓存原子写入失败: {e}")
 
 
 def get_text_hash(text):
-    """基于原文内容和模型生成唯一哈希"""
+    """基于原文内容计算唯一哈希"""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def translate_text_with_retry(text, source_lang, cache):
     """
-    带持久化缓存、503重试与退避机制的智能翻译
+    带持久化缓存、失败冷却期、503重试与退避机制的智能翻译
     返回: (translated_text, status)
-    status 取值: cached, success, failed, skipped
+    status 取值: cached, success, failed, skipped, cooling_down
     """
     if not text or not text.strip():
         return "", "skipped"
     
-    if source_lang == "zh" or not source_lang:
+    # 归一化语言判断
+    lang = (source_lang or "").strip().lower()
+    if lang == "zh" or lang.startswith("zh-"):
         return text, "skipped"
         
     if not GEMINI_API_KEY:
         return text, "skipped"
 
-    # 计算缓存 Key
     text_hash = get_text_hash(text)
-    cache_key = f"{text_hash}_{source_lang}_{GEMINI_MODEL}"
+    cache_key = f"{text_hash}_{lang}_{GEMINI_MODEL}_{PROMPT_VERSION}"
     
-    # 1. 检查持久化缓存
+    # 1. 检查缓存
     if cache_key in cache:
         cached_item = cache[cache_key]
-        if cached_item.get("status") == "success":
+        status = cached_item.get("status")
+        
+        if status == "success":
             return cached_item["translated_text"], "cached"
+        elif status == "failed":
+            updated_at_str = cached_item.get("updated_at")
+            if updated_at_str:
+                try:
+                    up_dt = datetime.fromisoformat(updated_at_str)
+                    if (datetime.now(timezone.utc) - up_dt).total_seconds() < FAILURE_COOLDOWN_SECONDS:
+                        return text, "cooling_down"
+                except Exception:
+                    pass
 
-    # 2. 调用 Gemini API（带 503 重试与退避）
+    # 2. 调用 Gemini API（带 503 重试与指数退避）
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     headers = {"Content-Type": "application/json"}
     
-    lang_name = "俄语" if source_lang.lower() == "ru" else "英语" if source_lang.lower() == "en" else source_lang
+    lang_name = "俄语" if lang == "ru" else "英语" if lang == "en" else lang
     prompt = f"请将以下{lang_name}新闻精准翻译成流畅的中文，直接输出翻译结果，不要加任何多余的解释：\n\n{text}"
     
     payload = {
@@ -107,7 +132,6 @@ def translate_text_with_retry(text, source_lang, cache):
                 res_json = response.json()
                 translated = res_json["candidates"][0]["content"]["parts"][0]["text"].strip()
                 
-                # 写入缓存
                 cache[cache_key] = {
                     "translated_text": translated,
                     "status": "success",
@@ -116,9 +140,8 @@ def translate_text_with_retry(text, source_lang, cache):
                 return translated, "success"
                 
             elif response.status_code in [503, 429]:
-                # 遇到高负载 503 或限流 429，进行退避重试
                 sleep_time = backoff_factor ** (attempt + 1)
-                print(f"[!] API 遇到负载高峰 ({response.status_code})，将在 {sleep_time} 秒后进行第 {attempt+1} 次重试...")
+                print(f"[!] API 负载高峰/限流 ({response.status_code})，将在 {sleep_time} 秒后重试...")
                 time.sleep(sleep_time)
             else:
                 print(f"[-] 翻译 API 状态码异常 ({response.status_code}): {response.text}")
@@ -128,7 +151,7 @@ def translate_text_with_retry(text, source_lang, cache):
             print(f"[!] 翻译请求异常 ({e})，将在 {sleep_time} 秒后重试...")
             time.sleep(sleep_time)
 
-    # 失败降级：记录失败状态，返回原文
+    # 失败降级记录
     cache[cache_key] = {
         "translated_text": None,
         "status": "failed",
@@ -190,14 +213,16 @@ def normalize_full_text(text):
 
 
 def build_safe_topic_candidates(messages):
+    """构建同主题候选提示，修复 matched_cluster 变量引用并限制关键词集合上限"""
     clusters = []
     for msg in messages:
         msg_time = get_message_timestamp(msg)
-        # 仅使用成功翻译的中文或原文进行粗颗粒度主题候选聚类
         target_text = msg.get("translated_text") if msg.get("translation_status") in ["success", "cached"] else msg["text"]
+        
         words = set(w for w in re.findall(r'[\u4e00-\u9fa5a-z]{2,}', target_text.lower()))
         
         matched_cluster = None
+        match_reason = []
         for cluster in clusters:
             time_diff = abs((msg_time - cluster["base_time"]).total_seconds())
             if time_diff > 24 * 3600:
@@ -205,12 +230,17 @@ def build_safe_topic_candidates(messages):
             common_words = words.intersection(cluster["keywords"])
             if len(common_words) >= 3:
                 matched_cluster = cluster
+                match_reason = list(common_words)
                 break
                 
         if matched_cluster:
+            msg["match_reason"] = match_reason
             matched_cluster["sources"].append(msg)
-            matched_cluster["keywords"].update(words)
+            # 使用 matched_cluster 修复变量引用，并控制关键词上限防无限膨胀
+            if len(matched_cluster["keywords"]) < 50:
+                matched_cluster["keywords"].update(words)
         else:
+            msg["match_reason"] = []
             clusters.append({
                 "cluster_id": len(clusters) + 1,
                 "base_time": msg_time,
@@ -286,24 +316,30 @@ def run_processing_pipeline():
     # 加载翻译缓存
     translation_cache = load_translation_cache()
     
-    translation_stats = {"cached": 0, "success": 0, "failed": 0, "skipped": 0}
+    translation_stats = {"cached": 0, "success": 0, "failed": 0, "skipped": 0, "cooling_down": 0}
 
-    print(f"[*] 开始处理最近 7 天的 {len(recent_rows)} 条有效素材（启用持久化缓存与重试机制）...")
+    print(f"[*] 开始处理最近 7 天的 {len(recent_rows)} 条有效素材（启用持久化缓存、冷却重试与全量增量落盘）...")
 
-    # 执行 AI 翻译与状态记录
+    # 执行 AI 翻译与状态记录（改为每处理 5 条增量落盘一次，确保失败记录也不丢失）
+    processed_count_since_save = 0
     for msg in recent_rows:
         orig_text = msg["text"]
-        lang = msg.get("language", "en")
+        lang = (msg.get("language") or "en").strip().lower()
         translated, status = translate_text_with_retry(orig_text, lang, translation_cache)
         
         msg["translated_text"] = translated if status in ["success", "cached"] else None
         msg["translation_status"] = status
         translation_stats[status] += 1
+        
+        processed_count_since_save += 1
+        if processed_count_since_save >= 5:
+            save_translation_cache(translation_cache)
+            processed_count_since_save = 0
 
-    # 保存更新后的缓存
+    # 全局收尾保存一次缓存
     save_translation_cache(translation_cache)
 
-    # 去重处理（基于成功翻译的中文或原文）
+    # 去重处理
     unique_materials_map = {}
     duplicate_count = 0
 
@@ -368,25 +404,36 @@ def run_processing_pipeline():
     with (REPORTS_DIR / "pipeline_stats.json").open("w", encoding="utf-8") as f:
         json.dump(stats_data, f, ensure_ascii=False, indent=2)
 
-    # 生成 Markdown 简报
+    # 生成 Markdown 简报（增加透明化的匹配依据与关联来源列出）
     digest_md_path = REPORTS_DIR / "events_digest.md"
     with digest_md_path.open("w", encoding="utf-8") as f:
-        f.write(f"# 🌐 全球多语言情报与 AI 智能聚合简报\n\n")
+        f.write(f"# 🌐 全球多语言情报与 AI 智能聚合候选简报\n\n")
         f.write(f"> **处理时间**: `{utc_now_iso()}` | **AI 模型**: `{GEMINI_MODEL if GEMINI_API_KEY else '未启用'}`\n\n")
         f.write("## 📊 统计漏斗与翻译漏斗\n\n")
         f.write(f"- 数据库总量: `{total_database_count}` | 目标频道抓取: `{target_raw_count}`\n")
         f.write(f"- 近7天有效: `{len(recent_rows)}` | 去重后独立素材: `{len(deduped_recent_valid)}`\n")
-        f.write(f"- 翻译缓存命中: `{translation_stats['cached']}` | 新翻译成功: `{translation_stats['success']}` | 翻译失败: `{translation_stats['failed']}`\n\n---\n\n")
+        f.write(f"- 翻译缓存命中: `{translation_stats['cached']}` | 新翻译成功: `{translation_stats['success']}` | 翻译失败: `{translation_stats['failed']}` | 冷却中: `{translation_stats['cooling_down']}`\n\n---\n\n")
 
-        f.write("## 🧩 同主题候选提示 (待核查)\n\n")
+        f.write("## 🧩 同主题候选提示 (待人工核查)\n\n")
         for idx, cluster in enumerate(multi_source_candidates, 1):
             sources = cluster["sources"]
             primary_msg = sources[0]
             display_text = primary_msg.get('translated_text') or primary_msg['text']
-            f.write(f"### 候选组 #{idx} (共 {len(sources)} 个来源)\n\n")
-            f.write(f"> **核心摘要**: {display_text}\n\n")
-            f.write(f"- 主来源: @{primary_msg['channel']} ({primary_msg['language'].upper()}) | 🔗 [原文]({primary_msg['link']})\n\n---\n\n")
+            
+            f.write(f"### 候选组 #{idx} (包含 {len(sources)} 个多源报道)\n\n")
+            f.write(f"> **核心代表摘要**: {display_text}\n\n")
+            f.write(f"- **主来源**: @{primary_msg['channel']} ({primary_msg['language'].upper()}) | ⏱️ `{primary_msg['published_at'] or primary_msg['fetched_at']}`\n")
+            f.write(f"  - 🔗 [查看原文]({primary_msg['link']}) | 翻译状态: `{primary_msg.get('translation_status')}`\n\n")
+            
+            f.write("**🔗 关联来源与核查依据**:\n")
+            for src in sources[1:]:
+                reasons_str = ", ".join(src.get("match_reason", [])) or "内容强关联"
+                f.write(f"- **@{src['channel']}** ({src['language'].upper()}) | ⏱️ `{src['published_at'] or src['fetched_at']}`\n")
+                f.write(f"  - 🔗 [原文链接]({src['link']})\n")
+                f.write(f"  - 📌 匹配关键词依据: `[{reasons_str}]`\n")
+            f.write("\n---\n\n")
 
+    # 最新新闻速递（精细化区分翻译状态标签）
     latest_md_path = REPORTS_DIR / "latest_news.md"
     with latest_md_path.open("w", encoding="utf-8") as f:
         f.write("# 📰 最新规范新闻速递\n\n")
@@ -394,17 +441,26 @@ def run_processing_pipeline():
         for idx, row in enumerate(deduped_recent_valid, 1):
             pub_time = row['published_at'] or f"抓取于 {row['fetched_at']}"
             display_content = row.get('translated_text') or row['text']
-            status_tag = "【AI译文】" if row.get('translation_status') in ["success", "cached"] else "【原文降级】"
+            
+            status = row.get('translation_status')
+            if status in ["success", "cached"]:
+                status_tag = "【AI 译文】"
+            elif status == "failed":
+                status_tag = "【翻译失败·显示原文】"
+            elif status == "cooling_down":
+                status_tag = "【冷却重试中·显示原文】"
+            else:
+                status_tag = "【未启用/中文原样】"
             
             f.write(f"### [{idx}] @{row['channel']} ({row['language'].upper()}) | ⏱️ {pub_time}\n\n")
             f.write(f"**{status_tag}**: {display_content}\n\n")
-            if row.get('translation_status') in ["success", "cached"]:
+            if status in ["success", "cached"]:
                 f.write(f"<details><summary>点击查看外文原文</summary>\n\n> {row['text']}\n\n</details>\n\n")
             f.write(f"🔗 [查看原文]({row['link']})\n\n---\n\n")
 
     print(f"\n[+] 新闻处理流水线执行完毕！")
     print(f"    - 独立素材数: {len(deduped_recent_valid)}")
-    print(f"    - 翻译统计: 缓存命中 {translation_stats['cached']}, 成功 {translation_stats['success']}, 失败 {translation_stats['failed']}")
+    print(f"    - 翻译统计: 缓存命中 {translation_stats['cached']}, 成功 {translation_stats['success']}, 失败 {translation_stats['failed']}, 冷却 {translation_stats['cooling_down']}")
     print(f"    - 报告已生成至: {REPORTS_DIR}\n")
 
 
