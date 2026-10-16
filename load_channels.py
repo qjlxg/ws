@@ -5,7 +5,7 @@ from urllib.parse import urlparse, unquote
 
 ALLOWED_TG_DOMAINS = {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}
 DISABLED_VALUES = {"0", "false", "no", "disabled", "off"}
-USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{2,32}$")
 
 
 def _channel_name(raw_input):
