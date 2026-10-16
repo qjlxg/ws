@@ -12,7 +12,7 @@ from load_channels import load_and_clean_channels
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "data" / "news.db"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-USER_AGENT = "Mozilla/5.0 (compatible; GlobalNewsCollector/1.0; +https://t.me/)"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 REQUEST_TIMEOUT = 15
 REQUEST_DELAY = 1.0
 
@@ -65,7 +65,11 @@ def fetch_telegram_channel_preview(channel_name, session=None):
     try:
         response = session.get(
             url,
-            headers={"User-Agent": USER_AGENT},
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5"
+            },
             timeout=REQUEST_TIMEOUT,
             allow_redirects=True,
         )
