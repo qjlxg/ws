@@ -1,0 +1,8 @@
+channel,category,language,enabled
+reuters,international,en,0
+AP,international,en,0
+bbcnews,international,en,0
+rianovosti,military,ru,0
+tass_agency,military,ru,0
+lemondefr,international,fr,0
+dw_russian,international,ru,0
