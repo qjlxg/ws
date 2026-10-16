@@ -1,64 +1,36 @@
-name: process_news
+name: Process News Pipeline
 
 on:
-  # 1. 当脚本或工作流本身发生变动时自动触发
-  push:
-    branches:
-      - main
-      - master
-    paths:
-      - 'process_news.py'
-      - '.github/workflows/process_news.yml'
-  
-  # 2. 定时触发：北京时间每天早上 8:30 和晚上 20:30 运行（跟随采集完后半小时）
-  # UTC 00:30 与 UTC 12:30
   schedule:
-    - cron: '30 0,12 * * *'
-
-  # 3. 支持在 GitHub Actions 页面手动点击触发
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    - cron: '30 */6 * * *'  # 每6小时运行一次（可按需调整）
+  workflow_dispatch:      # 支持手动触发
 
 jobs:
   process:
     runs-on: ubuntu-latest
     
     steps:
-      - name: 检出代码仓库
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 设置 Python 环境
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
 
-      - name: 安装项目依赖
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests
 
-      - name: 恢复 SQLite 数据库缓存
-        id: cache-db
-        uses: actions/cache@v4
-        with:
-          path: data/news.db
-          key: ${{ runner.os }}-news-db-${{ hashFiles('channels.csv') }}
-          restore-keys: |
-            ${{ runner.os }}-news-db-
-
-      - name: 执行二次新闻处理与归类脚本
+      - name: Run Process News Pipeline
         env:
-          TZ: 'Asia/Shanghai'
-        run: |
-          python process_news.py
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python process_news.py
 
-      - name: 自动提交并保存整理报告与统计指标
+      - name: Commit and Push Generated Reports
         run: |
           git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add data/reports/
-          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-update news event digests and statistics [skip ci]" && git push)
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-update news digest and reports [skip ci]" && git push)
