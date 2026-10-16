@@ -1,3 +1,4 @@
 Psycho_Motivations en
 zvezdanews ru
 rtnews en
+CNN_English_News en
