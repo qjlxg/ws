@@ -1,7 +1,7 @@
 channel,category,language,enabled
 Psycho_Motivations,international,en,1
-AP,international,en,1
-bbcnews,international,en,1
+zvezdanews,international,ru,1
+rtnews,international,en,1
 rianovosti,military,ru,1
 tass_agency,military,ru,1
 lemondefr,international,fr,1
