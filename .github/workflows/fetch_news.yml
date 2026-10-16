@@ -9,7 +9,7 @@ on:
     paths:
       - 'fetch_news.py'
       - 'load_channels.py'
-      - 'channels.csv'
+      - 'channels.txt'
       - '.github/workflows/fetch_news.yml'
   
   # 2. 定时触发：北京时间每天早上 8 点和晚上 8 点自动运行
