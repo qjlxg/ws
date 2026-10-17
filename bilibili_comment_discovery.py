@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-B站全量评论素材自动发现脚本（中文表头直观版）
-- 输出表头全面中文化，方便用 Excel 直接查看与挑选素材
+B站全量评论素材自动发现脚本（精简干净版）
 """
 
 import os
@@ -23,14 +22,14 @@ MASTER_CSV = OUTPUT_DIR / "master_comment_pool.csv"
 METRICS_JSON = OUTPUT_DIR / "run_metrics.json"
 
 BASE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
 }
 
 SESSION = requests.Session()
 SESSION.headers.update(BASE_HEADERS)
 
-MIN_TEXT_LEN = 2      
-TARGET_CANDIDATES = 300  
+MIN_TEXT_LEN = 5   # 最小文本长度  意味着只要评论的文字长度达到 2个字及以上（例如“哈哈”、“路过”、“赞同”等），就会被允许收录进素材库。如果您觉得太短的无意义水评太多，可以把它调大（比如改成 5 或 10）   
+TARGET_CANDIDATES = 300  #目标候选数/单次上限 意味着脚本在本次运行中，只要累计收集到 300 条符合条件的新评论，就会主动停止继续向下翻页和扫描，从而节省时间和接口请求。如果您希望每次跑的时候抓得更多，可以把这个数字调得更大（比如 500 或 1000）
 
 def log(msg: str):
     print(f"[{datetime.now(BEIJING).strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
@@ -124,17 +123,14 @@ def fetch_bilibili_comments_paginated(aid: str, bvid: str, max_pages: int = 5) -
     return all_comments
 
 def main():
-    log("=== B站全量评论素材自动化发现任务启动（中文表头版） ===")
+    log("=== B站全量评论素材自动化发现任务启动 ===")
     
     existing_hashes = set()
     if MASTER_CSV.exists():
         try:
             df_old = pd.read_csv(MASTER_CSV)
-            # 兼容旧版英文列名或新版中文列名做去重
             if "评论指纹" in df_old.columns:
                 existing_hashes.update(df_old["评论指纹"].dropna().tolist())
-            elif "comment_hash" in df_old.columns:
-                existing_hashes.update(df_old["comment_hash"].dropna().tolist())
             log(f"已加载历史素材库，去重指纹数: {len(existing_hashes)} 条")
         except Exception as e:
             log(f"加载历史库提示: {e}")
@@ -166,7 +162,6 @@ def main():
             is_24h = "是" if (NOW - c_time) <= timedelta(hours=24) else "否"
             score = score_comment(c_text, c_likes)
 
-            # 采用直观的中文键名，把“评论内容”排在最前面
             new_candidates.append({
                 "评论内容": c_text,
                 "点赞数": c_likes,
@@ -193,37 +188,17 @@ def main():
         df_new = pd.DataFrame(new_candidates)
         if MASTER_CSV.exists():
             df_master = pd.read_csv(MASTER_CSV)
-            # 如果以前是旧版英文表头，自动做一次列名转换映射
-            rename_dict = {
-                "text": "评论内容",
-                "likes": "点赞数",
-                "user_name": "用户昵称",
-                "source_title": "视频标题",
-                "source_url": "来源链接",
-                "create_time": "发表时间",
-                "score": "综合评分",
-                "is_recent_24h": "24h内",
-                "group_id": "视频ID",
-                "topic": "分类/话题",
-                "status": "审核状态",
-                "collected_at": "采集时间",
-                "comment_hash": "评论指纹"
-            }
-            df_master = df_master.rename(columns=rename_dict)
             df_master = pd.concat([df_master, df_new], ignore_index=True)
-            # 按评论指纹去重
             if "评论指纹" in df_master.columns:
                 df_master = df_master.drop_duplicates(subset=["评论指纹"], keep="first")
         else:
             df_master = df_new
 
-        # 重新整理列顺序，把最关键的信息放最前面
         column_order = [
             "评论内容", "点赞数", "视频标题", "来源链接", 
             "发表时间", "用户昵称", "综合评分", "24h内", 
             "分类/话题", "审核状态", "采集时间", "视频ID", "评论指纹"
         ]
-        # 只保留存在的列
         column_order = [col for col in column_order if col in df_master.columns]
         df_master = df_master[column_order]
 
