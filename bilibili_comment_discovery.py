@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-B站全量评论素材自动发现脚本（多页翻页 + 50视频大容量版）
-- 功能：扫描 50 个热门视频，每个视频支持连续翻多页抓取高赞/最新评论，全量持久化去重。
+B站全量评论素材自动发现脚本（中文表头直观版）
+- 输出表头全面中文化，方便用 Excel 直接查看与挑选素材
 """
 
 import os
@@ -30,7 +30,7 @@ SESSION = requests.Session()
 SESSION.headers.update(BASE_HEADERS)
 
 MIN_TEXT_LEN = 2      
-TARGET_CANDIDATES = 300  # 提高单次运行的收集上限
+TARGET_CANDIDATES = 300  
 
 def log(msg: str):
     print(f"[{datetime.now(BEIJING).strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
@@ -47,7 +47,6 @@ def filter_comment(text: str, likes: int) -> bool:
     return True
 
 def fetch_bilibili_popular_videos(limit: int = 50) -> List[Dict]:
-    """将扫描视频基数扩大到 50 个"""
     url = "https://api.bilibili.com/x/web-interface/popular"
     headers = {**BASE_HEADERS, "Referer": "https://www.bilibili.com/"}
     try:
@@ -74,7 +73,6 @@ def fetch_bilibili_popular_videos(limit: int = 50) -> List[Dict]:
     return []
 
 def fetch_bilibili_comments_paginated(aid: str, bvid: str, max_pages: int = 5) -> List[Dict]:
-    """支持多页翻页抓取评论（每页 20 条，默认抓 5 页 = 最多 100 条/视频）"""
     url = "https://api.bilibili.com/x/v2/reply"
     headers = {
         **BASE_HEADERS,
@@ -83,13 +81,12 @@ def fetch_bilibili_comments_paginated(aid: str, bvid: str, max_pages: int = 5) -
     
     all_comments = []
     for page in range(1, max_pages + 1):
-        # B站分页使用 next 参数或 offset，这里使用标准 pagination 模式
         params = {
             "type": 1, 
             "oid": aid, 
-            "sort": 2, # 按热度排序
-            "ps": 20,  # 单页20条（符合 API 上限）
-            "pn": page # 页码
+            "sort": 2, 
+            "ps": 20,  
+            "pn": page 
         }
         
         try:
@@ -97,11 +94,11 @@ def fetch_bilibili_comments_paginated(aid: str, bvid: str, max_pages: int = 5) -
             if r.status_code == 200:
                 data = r.json()
                 if data.get("code") != 0:
-                    break # 如果翻页到底或报错则跳出
+                    break
                 
                 replies = data.get("data", {}).get("replies") or []
                 if not replies:
-                    break # 没有更多评论了
+                    break
                 
                 for r_item in replies:
                     try:
@@ -120,26 +117,28 @@ def fetch_bilibili_comments_paginated(aid: str, bvid: str, max_pages: int = 5) -
                             })
                     except Exception:
                         continue
-            time.sleep(0.4) # 翻页礼貌延时
+            time.sleep(0.4)
         except Exception:
             break
             
     return all_comments
 
 def main():
-    log("=== B站全量评论素材自动化发现任务启动（大容量翻页版） ===")
+    log("=== B站全量评论素材自动化发现任务启动（中文表头版） ===")
     
     existing_hashes = set()
     if MASTER_CSV.exists():
         try:
             df_old = pd.read_csv(MASTER_CSV)
-            if "comment_hash" in df_old.columns:
+            # 兼容旧版英文列名或新版中文列名做去重
+            if "评论指纹" in df_old.columns:
+                existing_hashes.update(df_old["评论指纹"].dropna().tolist())
+            elif "comment_hash" in df_old.columns:
                 existing_hashes.update(df_old["comment_hash"].dropna().tolist())
             log(f"已加载历史素材库，去重指纹数: {len(existing_hashes)} 条")
         except Exception as e:
             log(f"加载历史库提示: {e}")
 
-    # 获取 50 个热门视频
     videos = fetch_bilibili_popular_videos(limit=50)
     new_candidates = []
 
@@ -149,7 +148,6 @@ def main():
         video_title = vid["title"]
         video_url = vid["url"]
         
-        # 每个视频翻 5 页抓取
         comments = fetch_bilibili_comments_paginated(aid, bvid, max_pages=5)
         time.sleep(0.6)
 
@@ -162,43 +160,74 @@ def main():
                 continue
                 
             h = text_hash(c_text)
-            if h in existing_hashes or h in {item["comment_hash"] for item in new_candidates}:
+            if h in existing_hashes or h in {item["评论指纹"] for item in new_candidates}:
                 continue
                 
-            is_24h = 1 if (NOW - c_time) <= timedelta(hours=24) else 0
+            is_24h = "是" if (NOW - c_time) <= timedelta(hours=24) else "否"
             score = score_comment(c_text, c_likes)
 
+            # 采用直观的中文键名，把“评论内容”排在最前面
             new_candidates.append({
-                "comment_hash": h,
-                "text": c_text,
-                "source_url": video_url,
-                "source_title": video_title,
-                "create_time": c_time.isoformat(),
-                "is_recent_24h": is_24h,
-                "likes": c_likes,
-                "score": score,
-                "user_name": c["user_name"],
-                "group_id": aid,
-                "topic": "B站全量翻页精选",
-                "status": "unreviewed",
-                "collected_at": NOW.isoformat(),
+                "评论内容": c_text,
+                "点赞数": c_likes,
+                "用户昵称": c["user_name"],
+                "视频标题": video_title,
+                "来源链接": video_url,
+                "发表时间": c_time.strftime('%Y-%m-%d %H:%M:%S'),
+                "综合评分": score,
+                "24h内": is_24h,
+                "视频ID": aid,
+                "分类/话题": "B站热门精选",
+                "审核状态": "未审核",
+                "采集时间": NOW.strftime('%Y-%m-%d %H:%M:%S'),
+                "评论指纹": h
             })
 
         if len(new_candidates) >= TARGET_CANDIDATES:
             log(f"已收集到充足候选评论 ({len(new_candidates)} 条)，结束本轮抓取")
             break
 
-    total_24h = sum(1 for x in new_candidates if x["is_recent_24h"] == 1)
+    total_24h = sum(1 for x in new_candidates if x["24h内"] == "是")
     
     if new_candidates:
         df_new = pd.DataFrame(new_candidates)
         if MASTER_CSV.exists():
             df_master = pd.read_csv(MASTER_CSV)
+            # 如果以前是旧版英文表头，自动做一次列名转换映射
+            rename_dict = {
+                "text": "评论内容",
+                "likes": "点赞数",
+                "user_name": "用户昵称",
+                "source_title": "视频标题",
+                "source_url": "来源链接",
+                "create_time": "发表时间",
+                "score": "综合评分",
+                "is_recent_24h": "24h内",
+                "group_id": "视频ID",
+                "topic": "分类/话题",
+                "status": "审核状态",
+                "collected_at": "采集时间",
+                "comment_hash": "评论指纹"
+            }
+            df_master = df_master.rename(columns=rename_dict)
             df_master = pd.concat([df_master, df_new], ignore_index=True)
+            # 按评论指纹去重
+            if "评论指纹" in df_master.columns:
+                df_master = df_master.drop_duplicates(subset=["评论指纹"], keep="first")
         else:
             df_master = df_new
 
-        df_master = df_master.sort_values(by="score", ascending=False)
+        # 重新整理列顺序，把最关键的信息放最前面
+        column_order = [
+            "评论内容", "点赞数", "视频标题", "来源链接", 
+            "发表时间", "用户昵称", "综合评分", "24h内", 
+            "分类/话题", "审核状态", "采集时间", "视频ID", "评论指纹"
+        ]
+        # 只保留存在的列
+        column_order = [col for col in column_order if col in df_master.columns]
+        df_master = df_master[column_order]
+
+        df_master = df_master.sort_values(by="综合评分", ascending=False)
         df_master.to_csv(MASTER_CSV, index=False, encoding="utf-8-sig")
         log(f"持久化成功！本次无条件收录新评论 {len(new_candidates)} 条 (24h内: {total_24h})。总库累计: {len(df_master)} 条。")
     else:
@@ -206,7 +235,7 @@ def main():
 
     metrics = {
         "last_run_time": NOW.isoformat(),
-        "platform": "bilibili_paginated",
+        "platform": "bilibili_cn_header",
         "videos_scanned": len(videos),
         "new_candidates_added": len(new_candidates),
         "total_master_pool": len(pd.read_csv(MASTER_CSV)) if MASTER_CSV.exists() else 0,
