@@ -1,334 +1,158 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微头条评论素材自动发现脚本
-- 平台：今日头条微头条（公开评论）
-- 运行环境：GitHub Actions 免费定时
-- 时间：优先最近24h，不足扩展至7天
-- 输出：原文、来源链接、时间、点赞数、评分 + 去重筛选后的候选
-- 明确限制：无官方免费API，依赖公开接口，可能失效；可选Cookie；不伪造数据
+抖音评论采集链路严谨版 MVP 验证探针脚本 (douyin_mvp_probe.py)
+- 修复：导入 Optional、修复异常赋值语法错误。
+- 强化：保留链接顺序、保存调试截图与 HTML 证据、严格区分原始节点与核验样本。
 """
 
 import os
-import json
-import time
-import hashlib
 import re
-from datetime import datetime, timedelta, timezone
+import time
 from pathlib import Path
-from typing import List, Dict, Any, Optional
-from urllib.parse import quote
+from typing import Optional, List, Dict, Any
+from playwright.sync_api import sync_playwright
 
-import requests
-from dateutil import parser as date_parser
+KEYWORD = "县城生活"
+SEARCH_URL = f"https://www.douyin.com/search/{KEYWORD}?type=general"
+DEBUG_DIR = Path("debug_evidence")
+DEBUG_DIR.mkdir(exist_ok=True)
 
-# ==================== 配置 ====================
-BEIJING = timezone(timedelta(hours=8))
-NOW = datetime.now(BEIJING)
-OUTPUT_DIR = Path("data")
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-# 可选：从环境变量读取 Cookie（GitHub Secrets: TOUTIAO_COOKIE）
-COOKIE = os.getenv("TOUTIAO_COOKIE", "").strip()
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "zh-CN,zh;q=0.9",
-    "Referer": "https://www.toutiao.com/",
-    "Origin": "https://www.toutiao.com",
-}
-if COOKIE:
-    HEADERS["Cookie"] = COOKIE
-
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-
-# 筛选阈值
-MIN_LIKES = 5
-MIN_TEXT_LEN = 15
-MAX_COMMENTS_PER_POST = 30
-MAX_POSTS = 15
-TARGET_CANDIDATES = 20  # 目标候选数，不足时扩展时间
-
-# 反差/共鸣/讨论空间关键词（启发式）
-RESONANCE_KEYWORDS = [
-    "真的", "同感", "一样", "我也", "共鸣", "说到心坎", "太真实", "扎心",
-    "反差", "居然", "没想到", "竟然", "但是", "然而", "其实", "真相",
-    "讨论", "怎么看", "你怎么看", "争议", "对立", "两边", "立场"
-]
-CONTRAST_PATTERNS = [
-    r"表面.{0,10}实际", r"看起来.{0,10}其实", r"嘴上.{0,10}心里",
-    r"以前.{0,10}现在", r"说好.{0,10}结果"
-]
-
-# ==================== 工具函数 ====================
 def log(msg: str):
-    print(f"[{datetime.now(BEIJING).strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+    print(f"[MVP-PROBE] {msg}")
 
-def safe_get(url: str, params: dict = None, timeout: int = 12) -> Optional[dict]:
-    try:
-        r = SESSION.get(url, params=params, timeout=timeout)
-        if r.status_code == 200:
-            return r.json()
-        log(f"HTTP {r.status_code} for {url[:80]}")
-    except Exception as e:
-        log(f"请求失败: {e}")
-    return None
-
-def parse_time(ts: Any) -> Optional[datetime]:
-    if ts is None:
+def parse_likes(text: str) -> Optional[int]:
+    """严格解析点赞数，失败返回 None"""
+    if not text:
         return None
+    text = text.strip()
     try:
-        if isinstance(ts, (int, float)):
-            # 秒或毫秒
-            if ts > 1e12:
-                ts = ts / 1000
-            return datetime.fromtimestamp(ts, tz=BEIJING)
-        return date_parser.parse(str(ts)).astimezone(BEIJING)
+        if "w" in text.lower() or "万" in text:
+            num = float(re.sub(r"[^\d.]", "", text))
+            return int(num * 10000)
+        cleaned = re.sub(r"\D", "", text)
+        return int(cleaned) if cleaned else None
     except Exception:
         return None
 
-def is_within_hours(dt: Optional[datetime], hours: int) -> bool:
-    if not dt:
-        return False
-    return (NOW - dt) <= timedelta(hours=hours)
-
-def text_hash(text: str) -> str:
-    return hashlib.md5(re.sub(r"\s+", "", text).encode("utf-8")).hexdigest()
-
-def score_comment(text: str, likes: int) -> float:
-    """简单评分：点赞 + 长度 + 关键词 + 反差模式"""
-    score = min(likes * 0.5, 50)
-    score += min(len(text) / 10, 20)
-    text_lower = text.lower()
-    for kw in RESONANCE_KEYWORDS:
-        if kw in text:
-            score += 8
-    for pat in CONTRAST_PATTERNS:
-        if re.search(pat, text):
-            score += 15
-    if "?" in text or "？" in text:
-        score += 5  # 有讨论空间
-    return round(score, 1)
-
-def filter_candidate(c: Dict) -> bool:
-    text = c.get("text", "").strip()
-    likes = c.get("likes", 0)
-    if len(text) < MIN_TEXT_LEN or likes < MIN_LIKES:
-        return False
-    # 过滤纯表情/广告
-    if re.fullmatch(r"[\U0001F300-\U0001F9FF\s]+", text) or "加微信" in text or "私聊" in text:
-        return False
-    return True
-
-# ==================== 数据源 ====================
-def fetch_hot_topics() -> List[Dict]:
-    """免费热榜聚合（今日头条相关）"""
-    topics = []
-    # 60s API（免费、无需key）
-    urls = [
-        "https://60s.viki.moe/v2/toutiao",
-        "https://v2.xxapi.cn/api/toutiaohot",  # 备选
-    ]
-    for url in urls:
-        data = safe_get(url)
-        if not data:
-            continue
-        items = data.get("data") or data.get("list") or []
-        if isinstance(items, dict):
-            items = items.get("data") or items.get("list") or []
-        for item in items[:30]:
-            title = item.get("title") or item.get("name") or item.get("word") or ""
-            hot = item.get("hot") or item.get("hot_value") or item.get("score") or 0
-            link = item.get("url") or item.get("link") or ""
-            if title:
-                topics.append({
-                    "title": title,
-                    "hot": hot,
-                    "link": link,
-                    "source": "hot_board"
-                })
-        if topics:
-            log(f"热榜获取成功，共 {len(topics)} 条")
-            break
-    return topics
-
-def search_posts_by_keyword(keyword: str, count: int = 5) -> List[Dict]:
-    """通过搜索接口尝试获取相关微头条/文章（公开部分）"""
-    # 今日头条搜索接口经常变化，这里使用较稳定的公开路径示意
-    # 实际可能需要更新；失败时返回空，不伪造
-    url = "https://www.toutiao.com/api/pc/feed/"
-    params = {
-        "category": "search",
-        "keyword": keyword,
-        "max_behot_time": 0,
-        "count": count,
+def run_probe():
+    log(f"=== 开始抖音采集链路严谨版 MVP 验证 ===")
+    
+    diagnostics: Dict[str, Any] = {
+        "search_page_status": "PENDING",
+        "video_links_found": 0,
+        "final_video_url": None,
+        "navigated_to_video": False,
+        "comment_nodes_raw": 0,
+        "verified_comments_extracted": 0,
+        "failure_reason": None
     }
-    data = safe_get(url, params)
-    posts = []
-    if data and "data" in data:
-        for item in data.get("data", [])[:count]:
-            group_id = item.get("group_id") or item.get("item_id")
-            title = item.get("title") or item.get("abstract") or keyword
-            if group_id:
-                posts.append({
-                    "group_id": str(group_id),
-                    "title": title,
-                    "url": f"https://www.toutiao.com/article/{group_id}/",
-                    "publish_time": parse_time(item.get("behot_time") or item.get("publish_time")),
-                })
-    return posts
 
-def fetch_comments(group_id: str, offset: int = 0, count: int = 20) -> List[Dict]:
-    """获取评论（公开接口，可能随时失效）"""
-    url = "https://www.toutiao.com/article/v2/tab_comments/"
-    params = {
-        "aid": 24,
-        "app_name": "toutiao-web",
-        "group_id": group_id,
-        "item_id": group_id,
-        "offset": offset,
-        "count": count,
-    }
-    data = safe_get(url, params)
-    comments = []
-    if not data:
-        return comments
+    with sync_playwright() as p:
+        # 本地调试建议设为 headless=False 观察真实浏览器行为
+        browser = p.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 800}
+        )
+        page = context.new_page()
 
-    # 兼容多种返回结构
-    raw_list = []
-    if "data" in data:
-        d = data["data"]
-        if isinstance(d, list):
-            raw_list = d
-        elif isinstance(d, dict):
-            raw_list = d.get("comments") or d.get("data") or []
-    elif "comments" in data:
-        raw_list = data["comments"]
-
-    for item in raw_list:
         try:
-            text = item.get("text") or item.get("content") or item.get("comment_content") or ""
-            if not text:
-                continue
-            likes = int(item.get("digg_count") or item.get("like_count") or item.get("likes") or 0)
-            create_time = parse_time(item.get("create_time") or item.get("create_timestamp") or item.get("time"))
-            user = item.get("user") or {}
-            user_name = user.get("name") or user.get("screen_name") or item.get("user_name") or "匿名"
-            comment_id = str(item.get("id") or item.get("comment_id") or text_hash(text))
-            comments.append({
-                "comment_id": comment_id,
-                "text": text.strip(),
-                "likes": likes,
-                "create_time": create_time.isoformat() if create_time else None,
-                "user_name": user_name,
-                "group_id": group_id,
-                "source_url": f"https://www.toutiao.com/article/{group_id}/",
-            })
-        except Exception:
-            continue
-    return comments
+            # 1. 访问搜索页并保存证据
+            log("1. 正在加载抖音搜索结果页...")
+            page.goto(SEARCH_URL, timeout=30000)
+            page.wait_for_timeout(5000)
+            
+            # 保存搜索页证据用于人工核验
+            page.screenshot(path=str(DEBUG_DIR / "search_page.png"), full_page=False)
+            with open(DEBUG_DIR / "search_page.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+            diagnostics["search_page_status"] = "LOADED"
 
-# ==================== 主流程 ====================
-def main():
-    log("=== 微头条评论素材自动发现开始 ===")
-    log(f"当前北京时间: {NOW.isoformat()}")
-    log(f"Cookie 状态: {'已提供（可选）' if COOKIE else '未提供（匿名模式）'}")
+            # 2. 提取真实视频链接（保持原始顺序并去重）
+            log("2. 正在提取搜索结果中的真实视频链接...")
+            raw_links = page.eval_on_selector_all("a[href*='/video/']", "elements => elements.map(e => e.href)")
+            
+            seen = set()
+            video_urls = []
+            for l in raw_links:
+                if "/video/" in l and l not in seen:
+                    seen.add(l)
+                    video_urls.append(l)
 
-    all_candidates = []
-    seen_hashes = set()
-    hours_list = [24, 24*7]  # 优先24h，不足扩展到7天
+            diagnostics["video_links_found"] = len(video_urls)
+            log(f"按原始顺序捕获到唯一候选视频链接数: {len(video_urls)}")
 
-    # 1. 获取热榜
-    hot_topics = fetch_hot_topics()
-    if not hot_topics:
-        log("警告：热榜获取失败，将尝试直接关键词搜索（结果可能为空）")
-        hot_topics = [{"title": "社会", "hot": 0, "link": "", "source": "fallback"}]
+            if not video_urls:
+                diagnostics["failure_reason"] = "未能从搜索页捕获到任何 /video/ 链接，可能触发反爬或页面DOM变更。请检查 debug_evidence/search_page.html。"
+                log(f"【验证中断】 {diagnostics['failure_reason']}")
+                browser.close()
+                print_diagnostics(diagnostics)
+                return
 
-    for max_hours in hours_list:
-        log(f"--- 尝试时间范围：最近 {max_hours} 小时 ---")
-        for topic in hot_topics[:12]:
-            keyword = topic["title"]
-            log(f"处理热门话题: {keyword[:40]}...")
+            # 取第一个视频进行穿透测试
+            target_video_url = video_urls[0]
+            diagnostics["final_video_url"] = target_video_url
+            log(f"3. 尝试进入第一个真实视频详情页: {target_video_url}")
+            
+            page.goto(target_video_url, timeout=30000)
+            page.wait_for_timeout(6000)
+            
+            # 保存视频页证据
+            page.screenshot(path=str(DEBUG_DIR / "video_detail.png"), full_page=False)
+            with open(DEBUG_DIR / "video_detail.html", "w", encoding="utf-8") as f:
+                f.write(page.content())
+            diagnostics["navigated_to_video"] = True
 
-            # 搜索相关内容
-            posts = search_posts_by_keyword(keyword, count=4)
-            if not posts:
-                # 无搜索结果时，尝试用热榜链接中的ID（如果有）
-                continue
+            # 4. 在详情页抓取评论节点（区分原始疑似节点与核验样本）
+            log("4. 正在扫描视频详情页的评论区...")
+            comment_elements = page.query_selector_all("[class*='comment'], [data-e2e*='comment']")
+            diagnostics["comment_nodes_raw"] = len(comment_elements)
+            log(f"页面捕获到疑似评论相关DOM节点数: {len(comment_elements)}")
 
-            for post in posts:
-                group_id = post["group_id"]
-                pub_time = post.get("publish_time")
-                if pub_time and not is_within_hours(pub_time, max_hours):
+            verified_samples = []
+            for el in comment_elements:
+                try:
+                    text = el.inner_text().strip()
+                    # 基础过滤：过短或不包含换行（通常非结构化评论卡片）的排除
+                    if len(text) < 12 or "\n" not in text:
+                        continue
+                    
+                    # 严格要求：不使用默认值。若拿不到点赞或时间，显式设为 None
+                    verified_samples.append({
+                        "source_url": target_video_url,
+                        "text": text[:200],  # 截取前200字
+                        "likes": None,       // 待后续选择器精准匹配，绝不赋假值 5 或 10
+                        "create_time": None, // 待后续选择器精准匹配
+                        "extracted_at": time.strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                    if len(verified_samples) >= 5: # 仅取前5条做验证
+                        break
+                except Exception:
                     continue
 
-                comments = fetch_comments(group_id, count=MAX_COMMENTS_PER_POST)
-                time.sleep(1.2)  # 礼貌延时
+            diagnostics["verified_comments_extracted"] = len(verified_samples)
 
-                for c in comments:
-                    c_time = parse_time(c.get("create_time"))
-                    if c_time and not is_within_hours(c_time, max_hours):
-                        continue
-                    if not filter_candidate(c):
-                        continue
-                    h = text_hash(c["text"])
-                    if h in seen_hashes:
-                        continue
-                    seen_hashes.add(h)
+            if verified_samples:
+                log(f"【阶段性验证成功】成功提取到通过基础结构核验的原始评论块 {len(verified_samples)} 条！")
+                log(f"提示：页面截图与 HTML 已保存在 {DEBUG_DIR}/ 目录，请人工打开检查其是否真正属于评论区。")
+            else:
+                diagnostics["failure_reason"] = "成功进入视频详情页，但未能在当前选择器下提取到符合长度和结构的评论块。"
+                log(f"【验证受阻】 {diagnostics['failure_reason']}")
 
-                    score = score_comment(c["text"], c["likes"])
-                    candidate = {
-                        "text": c["text"],
-                        "source_url": c["source_url"],
-                        "create_time": c.get("create_time"),
-                        "likes": c["likes"],
-                        "score": score,
-                        "user_name": c.get("user_name"),
-                        "group_id": group_id,
-                        "topic": keyword,
-                        "collected_at": NOW.isoformat(),
-                    }
-                    all_candidates.append(candidate)
+        except Exception as e:
+            diagnostics["failure_reason"] = str(e)
+            log(f"【验证异常】 发生未捕获异常: {e}")
 
-        if len(all_candidates) >= TARGET_CANDIDATES:
-            log(f"已达到目标候选数 {TARGET_CANDIDATES}，停止扩展时间范围")
-            break
+        browser.close()
+        print_diagnostics(diagnostics)
 
-    # 排序并截断
-    all_candidates.sort(key=lambda x: x["score"], reverse=True)
-    final = all_candidates[:50]
-
-    # 输出
-    out_file = OUTPUT_DIR / f"comments_{NOW.strftime('%Y%m%d_%H%M%S')}.json"
-    result = {
-        "meta": {
-            "script": "weituo_tiao_comment_discovery",
-            "beijing_time": NOW.isoformat(),
-            "cookie_used": bool(COOKIE),
-            "total_candidates": len(final),
-            "note": "仅真实公开评论；接口可能随时失效；无官方免费API；不伪造数据",
-            "limitations": [
-                "评论接口为逆向公开接口，随时可能加签/限流/失效",
-                "匿名模式数据量有限，深度评论建议提供 Cookie",
-                "热榜与搜索结果受平台推荐与反爬影响",
-                "筛选为启发式，非完美语义理解"
-            ]
-        },
-        "candidates": final
-    }
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-
-    log(f"完成！共筛选出 {len(final)} 条候选评论")
-    log(f"结果已保存: {out_file}")
-    if final:
-        log("Top 3 示例:")
-        for i, c in enumerate(final[:3], 1):
-            log(f"  {i}. [赞{c['likes']}|分{c['score']}] {c['text'][:60]}...")
-    else:
-        log("警告：本次未采集到符合条件的真实评论（接口可能受限或无热门内容）")
+def print_diagnostics(d: dict):
+    print("\n" + "="*50)
+    print(" 抖音采集链路严谨版 MVP 验证诊断报告 ")
+    print("="*50)
+    for k, v in d.items():
+        print(f" - {k}: {v}")
+    print("="*50 + "\n")
 
 if __name__ == "__main__":
-    main()
+    run_probe()
