@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-B站全量评论素材自动发现脚本（修复 ps out of bounds 限制版）
+B站全量评论素材自动发现脚本（多页翻页 + 50视频大容量版）
+- 功能：扫描 50 个热门视频，每个视频支持连续翻多页抓取高赞/最新评论，全量持久化去重。
 """
 
 import os
@@ -29,7 +30,7 @@ SESSION = requests.Session()
 SESSION.headers.update(BASE_HEADERS)
 
 MIN_TEXT_LEN = 2      
-TARGET_CANDIDATES = 100 
+TARGET_CANDIDATES = 300  # 提高单次运行的收集上限
 
 def log(msg: str):
     print(f"[{datetime.now(BEIJING).strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
@@ -45,7 +46,8 @@ def filter_comment(text: str, likes: int) -> bool:
         return False
     return True
 
-def fetch_bilibili_popular_videos(limit: int = 20) -> List[Dict]:
+def fetch_bilibili_popular_videos(limit: int = 50) -> List[Dict]:
+    """将扫描视频基数扩大到 50 个"""
     url = "https://api.bilibili.com/x/web-interface/popular"
     headers = {**BASE_HEADERS, "Referer": "https://www.bilibili.com/"}
     try:
@@ -71,52 +73,61 @@ def fetch_bilibili_popular_videos(limit: int = 20) -> List[Dict]:
         log(f"获取视频列表异常: {e}")
     return []
 
-def fetch_bilibili_comments(aid: str, bvid: str, max_count: int = 20) -> List[Dict]:
-    """将 max_count / ps 严格限制在 20 以内，防止触发 out of bounds 错误"""
+def fetch_bilibili_comments_paginated(aid: str, bvid: str, max_pages: int = 5) -> List[Dict]:
+    """支持多页翻页抓取评论（每页 20 条，默认抓 5 页 = 最多 100 条/视频）"""
     url = "https://api.bilibili.com/x/v2/reply"
     headers = {
         **BASE_HEADERS,
         "Referer": f"https://www.bilibili.com/video/{bvid}"
     }
-    params = {"type": 1, "oid": aid, "sort": 2, "ps": max_count}
     
-    try:
-        r = SESSION.get(url, params=params, headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            code = data.get("code")
-            if code != 0:
-                log(f"视频 [aid: {aid}] 评论接口返回非零状态码: code={code}, message={data.get('message')}")
-                return []
+    all_comments = []
+    for page in range(1, max_pages + 1):
+        # B站分页使用 next 参数或 offset，这里使用标准 pagination 模式
+        params = {
+            "type": 1, 
+            "oid": aid, 
+            "sort": 2, # 按热度排序
+            "ps": 20,  # 单页20条（符合 API 上限）
+            "pn": page # 页码
+        }
+        
+        try:
+            r = SESSION.get(url, params=params, headers=headers, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("code") != 0:
+                    break # 如果翻页到底或报错则跳出
+                
+                replies = data.get("data", {}).get("replies") or []
+                if not replies:
+                    break # 没有更多评论了
+                
+                for r_item in replies:
+                    try:
+                        content = r_item.get("content", {}).get("message", "").strip()
+                        likes = int(r_item.get("like", 0))
+                        uname = r_item.get("member", {}).get("uname", "匿名用户")
+                        ctime = r_item.get("ctime", int(time.time()))
+                        c_dt = datetime.fromtimestamp(ctime, tz=BEIJING)
+                        
+                        if content:
+                            all_comments.append({
+                                "text": content,
+                                "likes": likes,
+                                "create_time": c_dt,
+                                "user_name": uname,
+                            })
+                    except Exception:
+                        continue
+            time.sleep(0.4) # 翻页礼貌延时
+        except Exception:
+            break
             
-            replies = data.get("data", {}).get("replies") or []
-            comments = []
-            for r_item in replies:
-                try:
-                    content = r_item.get("content", {}).get("message", "").strip()
-                    likes = int(r_item.get("like", 0))
-                    uname = r_item.get("member", {}).get("uname", "匿名用户")
-                    ctime = r_item.get("ctime", int(time.time()))
-                    c_dt = datetime.fromtimestamp(ctime, tz=BEIJING)
-                    
-                    if content:
-                        comments.append({
-                            "text": content,
-                            "likes": likes,
-                            "create_time": c_dt,
-                            "user_name": uname,
-                        })
-                except Exception:
-                    continue
-            return comments
-        else:
-            log(f"评论请求 HTTP 状态码异常: {r.status_code}")
-    except Exception as e:
-        log(f"获取评论异常: {e}")
-    return []
+    return all_comments
 
 def main():
-    log("=== B站全量评论素材自动化发现任务启动（ps 修正版） ===")
+    log("=== B站全量评论素材自动化发现任务启动（大容量翻页版） ===")
     
     existing_hashes = set()
     if MASTER_CSV.exists():
@@ -128,7 +139,8 @@ def main():
         except Exception as e:
             log(f"加载历史库提示: {e}")
 
-    videos = fetch_bilibili_popular_videos(limit=20)
+    # 获取 50 个热门视频
+    videos = fetch_bilibili_popular_videos(limit=50)
     new_candidates = []
 
     for vid in videos:
@@ -137,9 +149,9 @@ def main():
         video_title = vid["title"]
         video_url = vid["url"]
         
-        # 传入 max_count=20
-        comments = fetch_bilibili_comments(aid, bvid, max_count=20)
-        time.sleep(0.8)
+        # 每个视频翻 5 页抓取
+        comments = fetch_bilibili_comments_paginated(aid, bvid, max_pages=5)
+        time.sleep(0.6)
 
         for c in comments:
             c_text = c["text"]
@@ -167,7 +179,7 @@ def main():
                 "score": score,
                 "user_name": c["user_name"],
                 "group_id": aid,
-                "topic": "B站全量精选",
+                "topic": "B站全量翻页精选",
                 "status": "unreviewed",
                 "collected_at": NOW.isoformat(),
             })
@@ -194,7 +206,7 @@ def main():
 
     metrics = {
         "last_run_time": NOW.isoformat(),
-        "platform": "bilibili_all",
+        "platform": "bilibili_paginated",
         "videos_scanned": len(videos),
         "new_candidates_added": len(new_candidates),
         "total_master_pool": len(pd.read_csv(MASTER_CSV)) if MASTER_CSV.exists() else 0,
