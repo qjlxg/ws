@@ -1,8 +1,8 @@
 {
-  "last_run_time": "2026-10-17T18:51:55.641607+08:00",
+  "last_run_time": "2026-10-17T22:49:49.793185+08:00",
   "platform": "bilibili_cn_header",
   "videos_scanned": 145,
-  "new_candidates_added": 322,
-  "total_master_pool": 482,
+  "new_candidates_added": 63,
+  "total_master_pool": 545,
   "status": "success"
 }
