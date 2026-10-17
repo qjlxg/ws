@@ -15,7 +15,7 @@ on:
 jobs:
   bilibili_discover:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 135
     permissions:
       contents: write  # 赋予 Git 提交和推送权限
     steps:
