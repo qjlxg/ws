@@ -1,0 +1,16 @@
+{
+  "meta": {
+    "script": "weituo_tiao_comment_discovery",
+    "beijing_time": "2026-10-17T16:31:24.268702+08:00",
+    "cookie_used": false,
+    "total_candidates": 0,
+    "note": "仅真实公开评论；接口可能随时失效；无官方免费API；不伪造数据",
+    "limitations": [
+      "评论接口为逆向公开接口，随时可能加签/限流/失效",
+      "匿名模式数据量有限，深度评论建议提供 Cookie",
+      "热榜与搜索结果受平台推荐与反爬影响",
+      "筛选为启发式，非完美语义理解"
+    ]
+  },
+  "candidates": []
+}
