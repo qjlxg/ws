@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-B站全量评论素材自动发现脚本（全收录宽松版）
-- 功能：获取B站热门视频，无条件抓取所有有效公开评论，去重后全量保存至 master_comment_pool.csv
+B站全量评论素材自动发现脚本（修复 ps out of bounds 限制版）
 """
 
 import os
@@ -15,7 +14,6 @@ from typing import List, Dict, Any, Optional
 import requests
 import pandas as pd
 
-# ==================== 配置 ====================
 BEIJING = timezone(timedelta(hours=8))
 NOW = datetime.now(BEIJING)
 OUTPUT_DIR = Path("data")
@@ -23,106 +21,103 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 MASTER_CSV = OUTPUT_DIR / "master_comment_pool.csv"
 METRICS_JSON = OUTPUT_DIR / "run_metrics.json"
 
-HEADERS = {
+BASE_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Referer": "https://www.bilibili.com",
 }
 
 SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+SESSION.headers.update(BASE_HEADERS)
 
-# 放宽后的阈值：只要有实际内容就收录
 MIN_TEXT_LEN = 2      
-TARGET_CANDIDATES = 100 # 扩大单次抓取上限，确保尽可能多收录
+TARGET_CANDIDATES = 100 
 
 def log(msg: str):
     print(f"[{datetime.now(BEIJING).strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
-
-def safe_get(url: str, params: dict = None) -> Optional[dict]:
-    try:
-        r = SESSION.get(url, params=params, timeout=10)
-        if r.status_code == 200:
-            return r.json()
-    except Exception as e:
-        log(f"请求异常 {url}: {e}")
-    return None
 
 def text_hash(text: str) -> str:
     return hashlib.md5(re.sub(r"\s+", "", text).encode("utf-8")).hexdigest()
 
 def score_comment(text: str, likes: int) -> float:
-    """宽松评分：以点赞数和字数做基础排序，不设高门槛"""
     return float(likes) + len(text) * 0.1
 
 def filter_comment(text: str, likes: int) -> bool:
-    """极度宽松的过滤：只要不是空文本或极短乱码，全部放行"""
     if not text or len(text.strip()) < MIN_TEXT_LEN:
         return False
     return True
 
-# ==================== 核心数据获取 ====================
 def fetch_bilibili_popular_videos(limit: int = 20) -> List[Dict]:
-    """获取B站全站热门视频列表"""
     url = "https://api.bilibili.com/x/web-interface/popular"
-    params = {"ps": limit, "pn": 1}
-    data = safe_get(url, params)
-    
-    videos = []
-    if data and data.get("code") == 0:
-        items = data.get("data", {}).get("list", [])
-        for item in items:
-            aid = item.get("aid")
-            bvid = item.get("bvid")
-            title = item.get("title", "")
-            owner = item.get("owner", {}).get("name", "")
-            if aid:
-                videos.append({
-                    "aid": str(aid),
-                    "bvid": bvid,
-                    "title": title,
-                    "url": f"https://www.bilibili.com/video/{bvid}",
-                    "author": owner
-                })
-    log(f"成功获取 B站热门视频 {len(videos)} 个")
-    return videos
+    headers = {**BASE_HEADERS, "Referer": "https://www.bilibili.com/"}
+    try:
+        r = SESSION.get(url, params={"ps": limit, "pn": 1}, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            videos = []
+            if data.get("code") == 0:
+                for item in data.get("data", {}).get("list", []):
+                    aid = item.get("aid")
+                    bvid = item.get("bvid")
+                    title = item.get("title", "")
+                    if aid and bvid:
+                        videos.append({
+                            "aid": str(aid),
+                            "bvid": bvid,
+                            "title": title,
+                            "url": f"https://www.bilibili.com/video/{bvid}"
+                        })
+            log(f"成功获取 B站热门视频 {len(videos)} 个")
+            return videos
+    except Exception as e:
+        log(f"获取视频列表异常: {e}")
+    return []
 
-def fetch_bilibili_comments(aid: str, max_count: int = 30) -> List[Dict]:
-    """获取评论（sort=2 按热度，同时也可以抓取更多）"""
+def fetch_bilibili_comments(aid: str, bvid: str, max_count: int = 20) -> List[Dict]:
+    """将 max_count / ps 严格限制在 20 以内，防止触发 out of bounds 错误"""
     url = "https://api.bilibili.com/x/v2/reply"
+    headers = {
+        **BASE_HEADERS,
+        "Referer": f"https://www.bilibili.com/video/{bvid}"
+    }
     params = {"type": 1, "oid": aid, "sort": 2, "ps": max_count}
-    data = safe_get(url, params)
     
-    comments = []
-    if data and data.get("code") == 0:
-        replies = data.get("data", {}).get("replies") or []
-        for r in replies:
-            try:
-                content = r.get("content", {}).get("message", "").strip()
-                likes = int(r.get("like", 0))
-                member = r.get("member", {})
-                uname = member.get("uname", "匿名用户")
-                ctime = r.get("ctime", int(time.time()))
-                
-                c_dt = datetime.fromtimestamp(ctime, tz=BEIJING)
-                
-                if not content:
+    try:
+        r = SESSION.get(url, params=params, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            code = data.get("code")
+            if code != 0:
+                log(f"视频 [aid: {aid}] 评论接口返回非零状态码: code={code}, message={data.get('message')}")
+                return []
+            
+            replies = data.get("data", {}).get("replies") or []
+            comments = []
+            for r_item in replies:
+                try:
+                    content = r_item.get("content", {}).get("message", "").strip()
+                    likes = int(r_item.get("like", 0))
+                    uname = r_item.get("member", {}).get("uname", "匿名用户")
+                    ctime = r_item.get("ctime", int(time.time()))
+                    c_dt = datetime.fromtimestamp(ctime, tz=BEIJING)
+                    
+                    if content:
+                        comments.append({
+                            "text": content,
+                            "likes": likes,
+                            "create_time": c_dt,
+                            "user_name": uname,
+                        })
+                except Exception:
                     continue
-                
-                comments.append({
-                    "text": content,
-                    "likes": likes,
-                    "create_time": c_dt,
-                    "user_name": uname,
-                })
-            except Exception:
-                continue
-    return comments
+            return comments
+        else:
+            log(f"评论请求 HTTP 状态码异常: {r.status_code}")
+    except Exception as e:
+        log(f"获取评论异常: {e}")
+    return []
 
-# ==================== 主流程与持久化 ====================
 def main():
-    log("=== B站全量评论素材自动化发现任务启动（全收录模式） ===" )
+    log("=== B站全量评论素材自动化发现任务启动（ps 修正版） ===")
     
-    # 1. 加载历史去重库
     existing_hashes = set()
     if MASTER_CSV.exists():
         try:
@@ -138,11 +133,13 @@ def main():
 
     for vid in videos:
         aid = vid["aid"]
+        bvid = vid["bvid"]
         video_title = vid["title"]
         video_url = vid["url"]
         
-        comments = fetch_bilibili_comments(aid, max_count=30)
-        time.sleep(0.5)
+        # 传入 max_count=20
+        comments = fetch_bilibili_comments(aid, bvid, max_count=20)
+        time.sleep(0.8)
 
         for c in comments:
             c_text = c["text"]
@@ -179,7 +176,6 @@ def main():
             log(f"已收集到充足候选评论 ({len(new_candidates)} 条)，结束本轮抓取")
             break
 
-    # 2. 持久化合并写入主库
     total_24h = sum(1 for x in new_candidates if x["is_recent_24h"] == 1)
     
     if new_candidates:
@@ -196,7 +192,6 @@ def main():
     else:
         log("本次运行未获取到有效评论。")
 
-    # 3. 记录运行统计
     metrics = {
         "last_run_time": NOW.isoformat(),
         "platform": "bilibili_all",
